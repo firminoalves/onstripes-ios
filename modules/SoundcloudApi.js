@@ -1,0 +1,455 @@
+import axios from 'axios';
+import { Linking } from 'react-native';
+import CacheDecorator from '../helpers/cacheDecorator';
+import { stripSSL } from '../helpers/utils';
+import querystring from 'query-string';
+
+class SoundCloudApi {
+  constructor({ endpoints, clientId, redirectUri, clientSecret }) {
+    this.endpoints = endpoints || {
+      v1: 'api.soundcloud.com',
+      v2: 'api-v2.soundcloud.com',
+    };
+    this.clientId = clientId;
+    this.clientSecret = clientSecret;
+    this.redirectUri = redirectUri;
+
+    this.timeout = 4 * 1e3;
+    this.extendedTimeout = 10 * 1e3;
+    this.transformTrackPayload = this.transformTrackPayload.bind(this);
+    this.transformPlaylistPayload = this.transformPlaylistPayload.bind(this);
+    this.transformSelectionPayload = this.transformSelectionPayload.bind(this);
+    this.handleAuthCode = this.handleAuthCode.bind(this);
+
+    this.initializeCacheDecorators();
+  }
+
+  initializeCacheDecorators() {
+    this.getPopularByGenre = CacheDecorator.withCache(
+      this.getPopularByGenre.bind(this),
+      'getPopularByGenre',
+      3600 * 1e3,
+    );
+    this.resolveScResource = CacheDecorator.withCache(
+      this.resolveScResource.bind(this),
+      'resolveScResource',
+      3600 * 1e3,
+    );
+    this.getScUserProfileTracks = CacheDecorator.withCache(
+      this.getScUserProfileTracks.bind(this),
+      'getScUserProfileTracks',
+      600 * 1e3,
+    );
+    this.getScUserPlaylists = CacheDecorator.withCache(
+      this.getScUserPlaylists.bind(this),
+      'getScUserPlaylists',
+      600 * 1e3,
+    );
+    this.getSoundcloudSelections = CacheDecorator.withCache(
+      this.getSoundcloudSelections.bind(this),
+      'getSoundcloudSelections',
+      3600 * 1e3,
+    );
+  }
+
+  request(...args) {
+    const requestObj = this._buildRequestObject(...args);
+    console.log('sc api request object', requestObj);
+    return axios(requestObj);
+  }
+
+  _toQueryString(paramObj) {
+    return Object.keys(paramObj)
+      .filter(key => paramObj[key] != undefined)
+      .map(key => `${encodeURIComponent(key)}=${encodeURIComponent(paramObj[key])}`)
+      .join('&');
+  }
+
+  _buildRequestObject(version, route, params = {}, method = SoundCloudApi.methods.GET, cancelToken, timeout) {
+    const urlParams = method === SoundCloudApi.methods.GET
+       ? `&${  this._toQueryString(params)}` : '';
+    const secure = method === SoundCloudApi.methods.GET ? '' : 's';
+    const accessToken = this.accessToken ? `&oauth_token=${this.accessToken}` : '';
+    const reqObj = {
+      method,
+      url: `http${secure}://${this.endpoints[version]}/${route}?client_id=${this.clientId}${accessToken}${urlParams}`,
+      timeout: timeout || this.timeout,
+      cancelToken,
+    };
+    if (method !== SoundCloudApi.methods.GET) {
+      reqObj.data = params;
+    }
+    return reqObj;
+  }
+
+  _extractCancelToken(opts) {
+    opts = { ...opts };
+    if (typeof opts !== 'object' || !('cancelToken' in opts)) {
+      return [undefined, opts];
+    }
+    let cancelToken;
+    if (typeof opts === 'object' && opts.cancelToken) {
+      cancelToken = opts.cancelToken;
+      delete opts.cancelToken;
+    }
+    return [cancelToken, opts];
+  }
+
+  subscribeProtocolCallback(cb) {
+    Linking.addEventListener('url', cb);
+  }
+
+  unsubscribeProtocolCallback(cb) {
+    Linking.removeEventListener('url', cb);
+  }
+
+  handleAuthCode({ url }) {
+    const fragment = url.split('#')[1];
+    if (fragment) {
+      const params = querystring.parse(fragment);
+      this.accessToken = params.access_token;
+      return this.accessToken;
+    }
+    return false;
+  }
+
+  authenticate() {
+    return new Promise((res, rej) => {
+      if (this.accessToken) res(this.accessToken);
+      const onAuthCallback = (args) => {
+        const authorized = this.handleAuthCode(args);
+        authorized ? res(authorized) : rej(new Error('auth failed'));
+        this.unsubscribeProtocolCallback(onAuthCallback);
+      };
+      this.subscribeProtocolCallback(onAuthCallback);
+      const connectUrl = [
+        'https://soundcloud.com/connect',
+        '?response_type=token',
+        '&scope=non-expiring',
+        `&client_id=${  this.clientId}`,
+        '&display=popup',
+        `&redirect_uri=${  this.redirectUri}`,
+        '&state=testing',
+      ].join('');
+      Linking.openURL(connectUrl);
+      console.log('opening auth url for soundcloud', connectUrl);
+    });
+  }
+
+  getAccessToken(code) {
+    return this.request(SoundCloudApi.api.v1, 'oauth2/token', {
+      client_secret: this.clientSecret,
+      redirect_uri: this.redirectUri,
+      grant_type: 'authorization_code',
+      code,
+    }, SoundCloudApi.methods.POST);
+  }
+
+  getOwnPlaylists() {
+    return this.request(SoundCloudApi.api.v1, 'me/playlists').then((resp) => resp.data.filter( p => p.streamable)
+        .map(this.transformPlaylistPayload)
+        .filter( p => p.tracks.length));
+  }
+
+  deleteUserPlaylist(playlistId) {
+    return this.request(SoundCloudApi.api.v1, `playlists/${playlistId}`,
+      undefined, SoundCloudApi.methods.DELETE);
+  }
+
+  createPlaylist(playlistName, tracksArray, sharing = 'public') {
+    const prom = this.request(SoundCloudApi.api.v2, 'playlists', {
+      playlist: {
+        sharing,
+        title: playlistName,
+        tracks: tracksArray,
+      },
+    }, SoundCloudApi.methods.POST);
+    prom.then(() => CacheDecorator.delCache('getScUserPlaylists'));
+    return prom;
+  }
+
+  updatePlaylist(playlistId, tracksArray) {
+    const prom = this.request(SoundCloudApi.api.v2, `playlists/${playlistId}`, {
+      playlist: {
+        tracks: tracksArray,
+      },
+    }, SoundCloudApi.methods.PUT);
+    prom.then(() => CacheDecorator.delCache('getScUserPlaylists'));
+    return prom;
+  }
+
+  searchPublicTracks(terms, limit = 100, offset = 0, opts = {}) {
+    const [cancelToken, queryOpts] = this._extractCancelToken(opts);
+    return this.request(SoundCloudApi.api.v1, 'tracks', {
+      limit,
+      offset,
+      streamable: true,
+      q: terms,
+      ...queryOpts,
+    }, SoundCloudApi.methods.GET , cancelToken).then((resp) => resp.data
+        .map(this.normalizeStreamUrlProperty)
+        .map(this.transformTrackPayload));
+  }
+
+  searchUsers(terms, limit = 5, offset = 0, opts = {}) {
+    const [cancelToken, queryOpts] = this._extractCancelToken(opts);
+    return this.request(SoundCloudApi.api.v1, 'users', {
+      limit,
+      offset,
+      q: terms,
+      ...queryOpts,
+    }, SoundCloudApi.methods.GET,cancelToken).then((resp) => resp.data.map(this.transformUserPayload));
+  }
+
+  getPopularByGenre(chartType = SoundCloudApi.chartType.TOP, genre = SoundCloudApi.genre.ALL, region = SoundCloudApi.region.WORLDWIDE, opts = {}) {
+    const [cancelToken, queryOpts] = this._extractCancelToken(opts);
+    const regionParam = region != SoundCloudApi.region.WORLDWIDE ? region : undefined;
+    return this.request(SoundCloudApi.api.v2, 'charts', {
+      limit: 50,
+      offset: 0,
+      streamable: true,
+      high_tier_only: false,
+      kind: chartType,
+      genre,
+      region: regionParam,
+      ...queryOpts,
+    }, SoundCloudApi.methods.GET, cancelToken)
+      .then((resp) => {
+        const retValue = resp.data.collection
+          .map(t => t.track)
+          .map(this.normalizeStreamUrlProperty)
+          .map(this.transformTrackPayload);
+        return retValue;
+      });
+  }
+
+  getSoundcloudSelections(opts = {}) {
+    const [cancelToken, queryOpts] = this._extractCancelToken(opts);
+    return this.request(SoundCloudApi.api.v2, 'selections', {
+      limit: 5,
+      offset: 0,
+      ...queryOpts,
+    }, SoundCloudApi.methods.GET, cancelToken)
+      .then((resp) => {
+        const retValue = resp.data.collection
+          .map(this.transformSelectionPayload)
+          .filter(s => !Object.values(SoundCloudApi.selectionChart).includes(s.urn));
+        return retValue;
+      });
+  }
+
+  resolveScResource(scResourceUrl) {
+    return this.request(SoundCloudApi.api.v1, 'resolve', {
+      url: scResourceUrl,
+    });
+  }
+
+  isScResource(val) {
+    return typeof val === 'string' && val.indexOf('//soundcloud.com') > -1;
+  }
+
+  resolveResourceId(scIdOrUrl) {
+    return this.isScResource(scIdOrUrl)
+      ? this.resolveScResource(scIdOrUrl) :
+      Promise.resolve({ data: { id: scIdOrUrl } });
+  }
+
+  getScUserProfile(scIdOrUrl) {
+    return this.resolveResourceId(scIdOrUrl).then((resp) => this.request(SoundCloudApi.api.v1,`users/${resp.data.id}`)).then((resp) => this.transformUserPayload(resp.data));
+  }
+
+  getScUserProfileTracks(scIdOrUrl) {
+    return this.resolveResourceId(scIdOrUrl).then((resp) => this.request(SoundCloudApi.api.v1,`users/${resp.data.id}/tracks`)).then((resp) => resp.data
+        .map(this.normalizeStreamUrlProperty)
+        .map(this.transformTrackPayload));
+  }
+
+  getScUserProfileFavorites(scIdOrUrl) {
+    return this.resolveResourceId(scIdOrUrl).then((resp) => this.request(SoundCloudApi.api.v1,`users/${resp.data.id}/favorites`)).then((resp) => resp.data
+        .map(this.normalizeStreamUrlProperty)
+        .map(this.transformTrackPayload));
+  }
+
+  getScUserPlaylists(scIdOrUrl) {
+    return this.resolveResourceId(scIdOrUrl).then((resp) => this.request(SoundCloudApi.api.v1,`users/${resp.data.id}/playlists`,
+              undefined,undefined,undefined,this.extendedTimeout)).then((resp) => {
+      const playlistData = resp.data;
+
+      return playlistData.filter(p => p.streamable)
+        .map(this.transformPlaylistPayload)
+        .filter(p => p.tracks.length);
+    });
+  }
+
+  getScPlaylist(scId) {
+    return this.request(SoundCloudApi.api.v1, `playlists/${scId}`,
+      undefined, undefined, undefined, this.extendedTimeout)
+      .then((resp) => this.transformPlaylistPayload(resp.data));
+  }
+
+  getClientId() {
+    return this.clientId;
+  }
+
+  normalizeStreamUrlProperty(trackObj) {
+    if (trackObj.stream_url) return trackObj;
+    trackObj.stream_url = `${trackObj.uri  }/stream`;
+    return trackObj;
+  }
+
+  transformSelectionPayload(selection) {
+    return {
+      urn: selection.urn,
+      label: selection.title,
+      description: selection.description,
+      playlists: (selection.playlists || []).map(this.transformPlaylistPayload),
+    };
+  }
+
+  transformPlaylistPayload(t) {
+    let tracks;
+    let artwork = t.artwork_url;
+    if (t.tracks) {
+      tracks = t.tracks.map(this.normalizeStreamUrlProperty)
+        .map(this.transformTrackPayload);
+      if (!artwork && tracks[0]) artwork = tracks[0].artwork;
+    }
+    return {
+      type: 'playlist',
+      id: t.id,
+      label: t.title,
+      username: t.user.username,
+      artwork,
+      duration: t.duration,
+      trackCount: t.track_count,
+      tracks,
+    };
+  }
+
+  transformTrackPayload(t) {
+    return this.resolvePlayableTrackItem(
+      {
+        id: t.id,
+        type: 'track',
+        label: t.title,
+        username: t.user.username,
+        streamUrl: t.stream_url,
+        artwork: t.artwork_url,
+        scUploaderLink: t.user.permalink_url,
+        duration: t.duration,
+        playbackCount: t.playback_count,
+        provider: 'soundcloud',
+      }
+);
+  }
+
+  transformUserPayload(user) {
+    return {
+      scUploaderLink: user.permalink_url,
+      id: user.id,
+      type: 'user',
+      username: user.username,
+      firstName: user.first_name,
+      lastName: user.last_name,
+      city: user.city,
+      country: user.country,
+      description: user.description,
+      followersCount: user.followers_count,
+      avatarUrl: user.avatar_url,
+      websiteTitle: user.website_title,
+      websiteCount: user.website_count,
+      likesCount: user.likes_count,
+      trackCount: user.track_count,
+    };
+  }
+
+  resolveStreamUrlFromTrackId(id) {
+    return `https://api.soundcloud.com/tracks/${id}/stream`;
+  }
+
+  resolvePlayableTrackItem(trackObj) {
+    // this strip of https is needed as the ATS excaption for tls version on
+    // the info.plist wont work on twice for same request and 302 redirect
+    // to a second exceptional domain
+    return Object.assign({}, trackObj, {
+      streamUrl: `${stripSSL(trackObj.streamUrl) 
+        }?client_id=${this.getClientId()}`,
+      artwork: stripSSL(trackObj.artwork),
+    });
+  }
+}
+SoundCloudApi.api = {
+  v1: 'v1',
+  v2: 'v2',
+};
+SoundCloudApi.chartType = {
+  TOP: 'top',
+  TRENDING: 'trending',
+};
+SoundCloudApi.selectionChart = {
+  TOP: 'soundcloud:selections:charts-top',
+  TRENDING: 'soundcloud:selections:charts-trending',
+};
+SoundCloudApi.genre = {
+  ALL: 'soundcloud:genres:all-music',
+  ALTERNATIVE_ROCK: 'soundcloud:genres:alternativerock',
+  AMBIENT: 'soundcloud:genres:ambient',
+  CLASSICAL: 'soundcloud:genres:classical',
+  COUNTRY: 'soundcloud:genres:country',
+  DANCE_EDM: 'soundcloud:genres:danceedm',
+  DANCEHALL: 'soundcloud:genres:dancehall',
+  DEEP_HOUSE: 'soundcloud:genres:deephouse',
+  DISCO: 'soundcloud:genres:disco',
+  DRUM_AND_BASS: 'soundcloud:genres:drumbass',
+  DUBSTEP: 'soundcloud:genres:dubstep',
+  ELECTRONIC: 'soundcloud:genres:electronic',
+  SONG_WRITER: 'soundcloud:genres:folksingersongwriter',
+  HIP_HOP: 'soundcloud:genres:hiphoprap',
+  HOUSE: 'soundcloud:genres:house',
+  INDIE: 'soundcloud:genres:indie',
+  JAZZ_AND_BLUES: 'soundcloud:genres:jazzblues',
+  LATIN: 'soundcloud:genres:latin',
+  METAL: 'soundcloud:genres:metal',
+  PIANO: 'soundcloud:genres:piano',
+  POP: 'soundcloud:genres:pop',
+  RNB_AND_SOUL: 'soundcloud:genres:rbsoul',
+  RAGGAE: 'soundcloud:genres:reggae',
+  REGGAETON: 'soundcloud:genres:reggaeton',
+  ROCK: 'soundcloud:genres:rock',
+  SOUNDTRACK: 'soundcloud:genres:soundtrack',
+  TECHNO: 'soundcloud:genres:techno',
+  TRANCE: 'soundcloud:genres:trance',
+  TRAP: 'soundcloud:genres:trap',
+  TRIP_HOP: 'soundcloud:genres:triphop',
+  WORLD: 'soundcloud:genres:world',
+  AUDIOBOOKS: 'soundcloud:genres:audiobooks',
+  BUSINESS: 'soundcloud:genres:business',
+  COMEDY: 'soundcloud:genres:comedy',
+  ENTERTAINMENT: 'soundcloud:genres:entertainment',
+  LEARNING: 'soundcloud:genres:learning',
+  POLITICS: 'soundcloud:genres:newspolitics',
+  RELIGION: 'soundcloud:genres:religionspirituality',
+  SCIENCE: 'soundcloud:genres:science',
+  SPORTS: 'soundcloud:genres:sports',
+  STORYTELLING: 'soundcloud:genres:storytelling',
+  TECHNOLOGY: 'soundcloud:genres:technology',
+};
+SoundCloudApi.region = {
+  WORLDWIDE: 'all',
+  AUSTRALIA: 'soundcloud:regions:AU',
+  CANADA: 'soundcloud:regions:CA',
+  FRANCE: 'soundcloud:regions:FR',
+  GERMANY: 'soundcloud:regions:DE',
+  IRELAND: 'soundcloud:regions:IE',
+  NETHERLANDS: 'soundcloud:regions:NL',
+  NEW_ZELAND: 'soundcloud:regions:NZ',
+  UNITED_KINGDOM: 'soundcloud:regions:GB',
+  UNITED_STATES: 'soundcloud:regions:US',
+};
+SoundCloudApi.methods = {
+  GET: 'get',
+  POST: 'post',
+  PUT: 'put',
+  DELETE: 'delete',
+};
+export default SoundCloudApi;
